@@ -84,6 +84,10 @@ class Solver(object):
         print(name)
         print("The number of parameters: {}".format(num_params))
 
+    def log_loss_tensorboard(self, loss_dict, step):
+        for k, v in loss_dict.items():
+            self.logger.add_scalar(k, v, step)
+
     def restore_model(self, resume_iters):
         """Restore the trained generator and discriminator."""
         print('Loading the trained models from step {}...'.format(resume_iters))
