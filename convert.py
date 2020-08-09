@@ -38,9 +38,11 @@ class ConvertDataset(object):
         self.mcep_mean_trg = self.trg_spk_stats['coded_sps_mean']
         self.mcep_std_trg = self.trg_spk_stats['coded_sps_std']
 
-        self.spk_idx = spk2idx[self.trg_spk]
-        spk_cat = to_categorical([self.spk_idx], num_classes=len(speakers))
-        self.spk_c_trg = spk_cat
+        self.spk_idx_src, self.spk_idx_trg = spk2idx[src_spk], spk2idx[trg_spk]
+        spk_cat_src = to_categorical([self.spk_idx_src], num_classes=len(speakers))
+        spk_cat_trg = to_categorical([self.spk_idx_trg], num_classes=len(speakers))
+        self.spk_c_org = spk_cat_src
+        self.spk_c_trg = spk_cat_trg
 
     def get_batch_test_data(self, batch_size=4):
         batch_data = []
@@ -107,9 +109,10 @@ def convert(config):
                         coded_sp_norm = (coded_sp - data_loader.mcep_mean_src) / data_loader.mcep_std_src
                         coded_sp_norm_tensor = torch.FloatTensor(coded_sp_norm.T).unsqueeze_(0).unsqueeze_(1).to(device)
                         spk_conds = torch.FloatTensor(data_loader.spk_c_trg).to(device)
+                        org_conds = torch.FloatTensor(data_loader.spk_c_org).to(device)
 
                         # generate converted speech
-                        coded_sp_converted_norm = generator(coded_sp_norm_tensor, spk_conds).data.cpu().numpy()
+                        coded_sp_converted_norm = generator(coded_sp_norm_tensor, org_conds, spk_conds).data.cpu().numpy()
                         coded_sp_converted = np.squeeze(coded_sp_converted_norm).T * data_loader.mcep_std_trg + data_loader.mcep_mean_trg
                         coded_sp_converted = np.ascontiguousarray(coded_sp_converted)
                         print("After being fed into G: ", coded_sp_converted.shape)

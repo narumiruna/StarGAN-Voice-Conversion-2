@@ -1,13 +1,15 @@
-from model import Generator
-from model import Discriminator
 import torch
 import torch.nn.functional as F
-from os.path import join, basename
 import time
 import datetime
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+from os.path import join, basename
+
+from model import Generator
+from model import Discriminator
 from data_loader import to_categorical
 from utils import *
-from tqdm import tqdm
 
 
 class Solver(object):
@@ -42,7 +44,7 @@ class Solver(object):
         self.test_iters = config.test_iters
 
         # Miscellaneous.
-        self.use_tensorboard = config.use_tensorboard
+        self.logger = SummaryWriter(log_dir=config.log_dir)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Directories.
@@ -56,10 +58,8 @@ class Solver(object):
         self.model_save_step = config.model_save_step
         self.lr_update_step = config.lr_update_step
 
-        # Build the model and tensorboard.
+        # Build the model.
         self.build_model()
-        if self.use_tensorboard:
-            self.build_tensorboard()
 
     def build_model(self):
         """Create a generator and a discriminator."""
@@ -207,28 +207,23 @@ class Solver(object):
 
             # Compute loss with real mc feats.
             d_out_src = self.discriminator(mc_real, spk_c_trg, spk_c_org)
-            d_loss_real = - torch.mean(d_out_src)
+            d_loss_real = torch.mean((1.0 - d_out_src) ** 2)
 
             # Compute loss with face mc feats.
-            mc_fake = self.generator(mc_real, spk_c_trg)
+            mc_fake = self.generator(mc_real, spk_c_org, spk_c_trg)
             d_out_fake = self.discriminator(mc_fake.detach(), spk_c_org, spk_c_trg)
-            d_loss_fake = torch.mean(d_out_fake)
-
-            # Compute loss for gradient penalty.
-            alpha = torch.rand(mc_real.size(0), 1, 1, 1).to(self.device)
-            x_hat = (alpha * mc_real.data + (1 - alpha) * mc_fake.data).requires_grad_(True)
-            d_out_src = self.discriminator(x_hat, spk_c_org, spk_c_trg)
-            d_loss_gp = self.gradient_penalty(d_out_src, x_hat)
+            d_loss_fake = torch.mean(d_out_fake ** 2)
 
             # Backward and optimize.
-            d_loss = d_loss_real + d_loss_fake + self.lambda_gp * d_loss_gp
+            d_loss = d_loss_real + d_loss_fake
             self.reset_grad()
             d_loss.backward()
             self.d_optimizer.step()
 
             # Logging.
             loss = {}
-            loss['D/loss_gp'] = d_loss_gp.item()
+            loss['D/loss_real'] = d_loss_real.item()
+            loss['D/loss_fake'] = d_loss_fake.item()
             loss['D/loss'] = d_loss.item()
 
             # =================================================================================== #
@@ -237,22 +232,25 @@ class Solver(object):
 
             if (i+1) % self.n_critic == 0:
                 # Original-to-target domain.
-                mc_fake = self.generator(mc_real, spk_c_trg)
+                mc_fake = self.generator(mc_real, spk_c_org, spk_c_trg)
                 g_out_src = self.discriminator(mc_fake, spk_c_org, spk_c_trg)
-                g_loss_fake = - torch.mean(g_out_src)
+                g_loss_fake = torch.mean((1.0 - g_out_src) ** 2)
 
                 # Target-to-original domain. Cycle-consistent.
-                mc_reconst = self.generator(mc_fake, spk_c_org)
+                mc_reconst = self.generator(mc_fake, spk_c_trg, spk_c_org)
                 g_loss_rec = torch.mean(torch.abs(mc_real - mc_reconst))
 
                 # Original-to-original, Id mapping loss. Mapping
-                mc_fake_id = self.generator(mc_real, spk_c_org)
+                mc_fake_id = self.generator(mc_real, spk_c_org, spk_c_org)
                 g_loss_id = torch.mean(torch.abs(mc_real - mc_fake_id))
 
                 # Backward and optimize.
+                if i > 10000:
+                    self.lambda_id = 0
+
                 g_loss = g_loss_fake \
-                    + self.lambda_rec * g_loss_rec \
-                    + self.lambda_id * g_loss_id
+                         + self.lambda_rec * g_loss_rec \
+                         + self.lambda_id * g_loss_id
 
                 self.reset_grad()
                 g_loss.backward()
@@ -261,6 +259,7 @@ class Solver(object):
                 # Logging.
                 loss['G/loss_fake'] = g_loss_fake.item()
                 loss['G/loss_rec'] = g_loss_rec.item()
+                loss['G/loss_id'] = g_loss_id.item()
                 loss['G/loss'] = g_loss.item()
 
             # =================================================================================== #
@@ -271,14 +270,11 @@ class Solver(object):
             if (i+1) % self.log_step == 0:
                 et = time.time() - start_time
                 et = str(datetime.timedelta(seconds=et))[:-7]
-                log = "Elapsed [{}], Iteration [{}/{}]".format(et, i+1, self.num_iters)
+                log = "Elapsed [{}], Iteration [{}/{}]".format(et, i + 1, self.num_iters)
                 for tag, value in loss.items():
                     log += ", {}: {:.4f}".format(tag, value)
                 print(log)
-
-                if self.use_tensorboard:
-                    for tag, value in loss.items():
-                        self.logger.scalar_summary(tag, value, i+1)
+                self.log_loss_tensorboard(loss, i + 1)
 
             if (i+1) % self.sample_step == 0:
                 sampling_rate = 16000
@@ -290,27 +286,29 @@ class Solver(object):
                         # print(wav_name)
                         f0, timeaxis, sp, ap = world_decompose(wav=wav, fs=sampling_rate, frame_period=frame_period)
                         f0_converted = pitch_conversion(f0=f0,
-                            mean_log_src=self.test_loader.logf0s_mean_src, std_log_src=self.test_loader.logf0s_std_src,
-                            mean_log_target=self.test_loader.logf0s_mean_trg, std_log_target=self.test_loader.logf0s_std_trg)
+                                                        mean_log_src=self.test_loader.logf0s_mean_src,
+                                                        std_log_src=self.test_loader.logf0s_std_src,
+                                                        mean_log_target=self.test_loader.logf0s_mean_trg,
+                                                        std_log_target=self.test_loader.logf0s_std_trg)
                         coded_sp = world_encode_spectral_envelop(sp=sp, fs=sampling_rate, dim=num_mcep)
 
                         coded_sp_norm = (coded_sp - self.test_loader.mcep_mean_src) / self.test_loader.mcep_std_src
                         coded_sp_norm_tensor = torch.FloatTensor(coded_sp_norm.T).unsqueeze_(0).unsqueeze_(1).to(self.device)
                         conds = torch.FloatTensor(self.test_loader.spk_c_trg).to(self.device)
-                        # print(conds.size())
-                        coded_sp_converted_norm = self.generator(coded_sp_norm_tensor, conds).data.cpu().numpy()
+                        org_conds = torch.FloatTensor(self.test_loader.spk_c_org).to(self.device)
+                        coded_sp_converted_norm = self.generator(coded_sp_norm_tensor, org_conds, conds).data.cpu().numpy()
                         coded_sp_converted = np.squeeze(coded_sp_converted_norm).T * self.test_loader.mcep_std_trg + self.test_loader.mcep_mean_trg
                         coded_sp_converted = np.ascontiguousarray(coded_sp_converted)
-                        # decoded_sp_converted = world_decode_spectral_envelop(coded_sp = coded_sp_converted, fs = sampling_rate)
                         wav_transformed = world_speech_synthesis(f0=f0_converted, coded_sp=coded_sp_converted,
-                                                                ap=ap, fs=sampling_rate, frame_period=frame_period)
+                                                                 ap=ap, fs=sampling_rate, frame_period=frame_period)
 
                         librosa.output.write_wav(
-                            join(self.sample_dir, str(i+1)+'-'+wav_name.split('.')[0]+'-vcto-{}'.format(self.test_loader.trg_spk)+'.wav'), wav_transformed, sampling_rate)
+                            join(self.sample_dir, str(i + 1) + '-' + wav_name.split('.')[0] + '-vcto-{}'.format(
+                                self.test_loader.trg_spk) + '.wav'), wav_transformed, sampling_rate)
                         if cpsyn_flag:
                             wav_cpsyn = world_speech_synthesis(f0=f0, coded_sp=coded_sp,
-                                                        ap=ap, fs=sampling_rate, frame_period=frame_period)
-                            librosa.output.write_wav(join(self.sample_dir, 'cpsyn-'+wav_name), wav_cpsyn, sampling_rate)
+                                                               ap=ap, fs=sampling_rate, frame_period=frame_period)
+                            librosa.output.write_wav(join(self.sample_dir, 'cpsyn-' + wav_name), wav_cpsyn, sampling_rate)
                     cpsyn_flag = False
 
             # Save model checkpoints.

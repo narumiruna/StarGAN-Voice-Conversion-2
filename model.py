@@ -14,19 +14,19 @@ class ConditionalInstanceNormalisation(nn.Module):
 
         self.dim_in = dim_in
         self.style_num = style_num
-        self.gamma = nn.Linear(style_num, dim_in)
-        self.beta = nn.Linear(style_num, dim_in)
+        self.gamma = nn.Linear(2*style_num, dim_in)
+        self.beta = nn.Linear(2*style_num, dim_in)
 
-    def forward(self, x, c):
+    def forward(self, x, c_src, c_trg):
         u = torch.mean(x, dim=2, keepdim=True)
         var = torch.mean((x - u) * (x - u), dim=2, keepdim=True)
         std = torch.sqrt(var + 1e-8)
 
-        # width = x.shape[2]
+        c = torch.cat([c_src, c_trg], dim=-1).to(self.device)
 
-        gamma = self.gamma(c.to(self.device))
+        gamma = self.gamma(c)
         gamma = gamma.view(-1, self.dim_in, 1)
-        beta = self.beta(c.to(self.device))
+        beta = self.beta(c)
         beta = beta.view(-1, self.dim_in, 1)
 
         h = (x - u) / std
@@ -43,9 +43,9 @@ class ResidualBlock(nn.Module):
         self.cin_1 = ConditionalInstanceNormalisation(dim_out, style_num)
         self.relu_1 = nn.GLU(dim=1)
 
-    def forward(self, x, c):
+    def forward(self, x, c, c_):
         x_ = self.conv_1(x)
-        x_ = self.cin_1(x_, c)
+        x_ = self.cin_1(x_, c, c_)
         x_ = self.relu_1(x_)
 
         return x_
@@ -114,9 +114,9 @@ class Generator(nn.Module):
         )
 
         # Out.
-        self.out = nn.Conv2d(in_channels=64, out_channels=1, kernel_size=7, stride=1, padding=3, bias=False)
+        self.out = nn.Conv2d(in_channels=64, out_channels=1, kernel_size=(5, 15), stride=1, padding=(2, 7), bias=False)
 
-    def forward(self, x, c):
+    def forward(self, x, c, c_):
         width_size = x.size(3)
 
         x = self.down_sample_1(x)
@@ -126,15 +126,15 @@ class Generator(nn.Module):
         x = x.contiguous().view(-1, 2304, width_size // 4)
         x = self.down_conversion(x)
 
-        x = self.residual_1(x, c)
-        x = self.residual_2(x, c)
-        x = self.residual_3(x, c)
-        x = self.residual_4(x, c)
-        x = self.residual_5(x, c)
-        x = self.residual_6(x, c)
-        x = self.residual_7(x, c)
-        x = self.residual_8(x, c)
-        x = self.residual_9(x, c)
+        x = self.residual_1(x, c, c_)
+        x = self.residual_2(x, c, c_)
+        x = self.residual_3(x, c, c_)
+        x = self.residual_4(x, c, c_)
+        x = self.residual_5(x, c, c_)
+        x = self.residual_6(x, c, c_)
+        x = self.residual_7(x, c, c_)
+        x = self.residual_8(x, c, c_)
+        x = self.residual_9(x, c, c_)
 
         x = self.up_conversion(x)
         x = x.view(-1, 256, 9, width_size // 4)
@@ -186,11 +186,10 @@ class Discriminator(nn.Module):
         self.fully_connected = nn.Linear(in_features=512, out_features=1)
 
         # Projection.
-        self.projection = nn.Linear(self.num_speakers, 512)
+        self.projection = nn.Linear(2*self.num_speakers, 512)
 
     def forward(self, x, c, c_):
-        # c_onehot = torch.cat((c, c_), dim=1).to(self.device)
-        c_onehot = c_
+        c_onehot = torch.cat((c, c_), dim=1).to(self.device)
 
         x = self.conv_layer_1(x)
 
@@ -200,12 +199,13 @@ class Discriminator(nn.Module):
         x_ = self.down_sample_4(x)
 
         h = torch.sum(x_, dim=(2, 3))
+        x = self.fully_connected(x_.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)  # b 1 h w
+        p = self.projection(c_onehot)  # b 512
 
-        x = self.fully_connected(h)
+        in_prod = p * h
 
-        p = self.projection(c_onehot)
-
-        x += torch.sum(p * h, dim=1, keepdim=True)
+        x = x.view(x.size(0), -1)
+        x = torch.mean(x, dim=-1) + torch.mean(in_prod, dim=-1)
 
         return x
 
@@ -261,6 +261,6 @@ if __name__ == '__main__':
     print('Testing Generator')
     print('-------------------------')
     print(f'Shape in: {mc_real.shape}')
-    mc_fake = generator(mc_real, spk_c_trg)
+    mc_fake = generator(mc_real, spk_c_org, spk_c_trg)
     print(f'Shape out: {mc_fake.shape}')
     print('------------------------')
