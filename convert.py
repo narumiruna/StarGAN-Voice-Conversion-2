@@ -9,6 +9,7 @@ from shutil import copy
 from data_loader import to_categorical
 from model import Generator
 from utils import world_decompose, pitch_conversion, world_encode_spectral_envelop, world_speech_synthesis, wav_padding
+import soundfile
 
 
 class ConvertDataset(object):
@@ -143,7 +144,7 @@ def convert(config):
                         wav_id = wav_name.split('.')[0]
 
                         # SAVE TARGET SYNTHESIZED
-                        librosa.output.write_wav(join(target_dir, f'{wav_id}-vcto-{data_loader.trg_spk}.wav'),
+                        soundfile.write(join(target_dir, f'{wav_id}-vcto-{data_loader.trg_spk}.wav'),
                                                  wav_transformed,
                                                  sampling_rate)
 
